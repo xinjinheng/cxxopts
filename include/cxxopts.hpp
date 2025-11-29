@@ -1867,10 +1867,14 @@ using PositionalListIterator = PositionalList::const_iterator;
 class OptionParser
 {
   public:
-  OptionParser(const OptionMap& options, const PositionalList& positional, bool allow_unrecognised)
+  OptionParser(const OptionMap& options, const PositionalList& positional, bool allow_unrecognised,
+              const std::unordered_map<std::string, std::string>& alias_map,
+              const std::unordered_set<std::string>& all_aliases)
   : m_options(options)
   , m_positional(positional)
   , m_allow_unrecognised(allow_unrecognised)
+  , m_alias_map(alias_map)
+  , m_all_aliases(all_aliases)
   {
   }
 
@@ -1909,17 +1913,22 @@ class OptionParser
 
   private:
 
+  std::string resolve_alias(const std::string& alias) const;
+
   void finalise_aliases();
 
   const OptionMap& m_options;
   const PositionalList& m_positional;
+  bool m_allow_unrecognised;
 
   std::vector<KeyValue> m_sequential{};
   std::vector<KeyValue> m_defaults{};
-  bool m_allow_unrecognised;
 
   ParsedHashMap m_parsed{};
   NameHashMap m_keys{};
+
+  const std::unordered_map<std::string, std::string>& m_alias_map;
+  const std::unordered_set<std::string>& m_all_aliases;
 };
 
 class Options
@@ -2058,6 +2067,37 @@ class Options
     return m_program;
   }
 
+  // Expose options for parser to use
+  const std::shared_ptr<OptionMap>& options() const
+  {
+    return m_options;
+  }
+
+  // Expose alias maps for parser to use
+  const std::unordered_map<std::string, std::string>& alias_map() const
+  {
+    return m_alias_to_original;
+  }
+
+  const std::unordered_set<std::string>& all_aliases() const
+  {
+    return m_all_aliases;
+  }
+
+  public:
+
+  void
+  add_alias(const std::string& original, const std::string& alias);
+
+  void
+  remove_alias(const std::string& alias);
+
+  std::vector<std::string>
+  get_aliases(const std::string& option) const;
+
+  std::string
+  resolve_alias(const std::string& alias) const;
+
   private:
 
   void
@@ -2066,6 +2106,115 @@ class Options
     const std::string& option,
     const std::shared_ptr<OptionDetails>& details
   );
+
+  void
+  add_alias(const std::string& original, const std::string& alias)
+  {
+    // Check if original option exists
+    if (m_options->find(original) == m_options->end())
+    {
+      throw std::invalid_argument("Original option '" + original + "' not found");
+    }
+
+    // Check for conflicts
+    check_alias_conflict(alias);
+
+    // Add alias to maps
+    m_alias_to_original[alias] = original;
+    m_original_to_aliases[original].push_back(alias);
+    m_all_aliases.insert(alias);
+  }
+
+  void
+  remove_alias(const std::string& alias)
+  {
+    auto it = m_alias_to_original.find(alias);
+    if (it == m_alias_to_original.end())
+    {
+      return; // Alias doesn't exist
+    }
+
+    std::string original = it->second;
+    m_alias_to_original.erase(it);
+    m_all_aliases.erase(alias);
+
+    // Remove alias from original's alias list
+    auto& aliases = m_original_to_aliases[original];
+    aliases.erase(std::remove(aliases.begin(), aliases.end(), alias), aliases.end());
+    if (aliases.empty())
+    {
+      m_original_to_aliases.erase(original);
+    }
+  }
+
+  std::vector<std::string>
+  get_aliases(const std::string& option) const
+  {
+    auto it = m_original_to_aliases.find(option);
+    if (it == m_original_to_aliases.end())
+    {
+      return {};
+    }
+    return it->second;
+  }
+
+  std::string
+  resolve_alias(const std::string& alias) const
+  {
+    std::unordered_set<std::string> visited;
+    return resolve_alias_internal(alias, visited);
+  }
+
+  std::string
+  resolve_alias_internal(const std::string& alias, std::unordered_set<std::string>& visited) const
+  {
+    auto it = m_alias_to_original.find(alias);
+    if (it == m_alias_to_original.end())
+    {
+      return alias; // Not an alias, return as is
+    }
+
+    if (visited.count(alias))
+    {
+      throw std::invalid_argument("Cycle detected in alias chain involving '" + alias + "'");
+    }
+
+    visited.insert(alias);
+    return resolve_alias_internal(it->second, visited);
+  }
+
+  void
+  check_alias_conflict(const std::string& alias) const
+  {
+    // Check if alias is already an option
+    if (m_options->find(alias) != m_options->end())
+    {
+      throw std::invalid_argument("Alias '" + alias + "' conflicts with existing option");
+    }
+
+    // Check if alias is already an alias
+    if (m_all_aliases.count(alias))
+    {
+      throw std::invalid_argument("Alias '" + alias + "' is already in use");
+    }
+
+    // Check if alias would create a cycle
+    try
+    {
+      std::unordered_set<std::string> visited;
+      visited.insert(alias);
+      std::string resolved = resolve_alias_internal(alias, visited);
+      if (resolved == alias)
+      {
+        throw std::invalid_argument("Alias '" + alias + "' would create a cycle");
+      }
+    }
+    catch (const std::invalid_argument&)
+    {
+      // If resolve_alias_internal throws, it means there's already a cycle
+      throw;
+    }
+  }
 
   String
   help_one_group(const std::string& group) const;
@@ -2096,6 +2245,19 @@ class Options
   //mapping from groups to help options
   std::vector<std::string> m_group{};
   std::map<std::string, HelpGroupDetails> m_help{};
+
+  //alias maps
+  std::unordered_map<std::string, std::string> m_alias_to_original{};
+  std::unordered_map<std::string, std::vector<std::string>> m_original_to_aliases{};
+  std::unordered_set<std::string> m_all_aliases{};
+
+  //private helper for resolving aliases with cycle detection
+  std::string
+  resolve_alias_internal(const std::string& alias, std::unordered_set<std::string>& visited) const;
+
+  //private helper to check for alias conflicts
+  void
+  check_alias_conflict(const std::string& alias) const;
 };
 
 class OptionAdder
@@ -2454,7 +2616,8 @@ OptionParser::consume_positional(const std::string& a, PositionalListIterator& n
 {
   while (next != m_positional.end())
   {
-    auto iter = m_options.find(*next);
+    std::string original = resolve_alias(*next);
+    auto iter = m_options.find(original);
     if (iter != m_options.end())
     {
       if (!iter->second->value().is_container())
@@ -2505,7 +2668,7 @@ inline
 ParseResult
 Options::parse(int argc, const char* const* argv)
 {
-  OptionParser parser(*m_options, m_positional, m_allow_unrecognised);
+  OptionParser parser(*m_options, m_positional, m_allow_unrecognised, m_alias_to_original, m_all_aliases);
 
   return parser.parse(argc, argv);
 }
@@ -2563,7 +2726,8 @@ OptionParser::parse(int argc, const char* const* argv)
         for (std::size_t i = 0; i != s.size(); ++i)
         {
           std::string name(1, s[i]);
-          auto iter = m_options.find(name);
+          std::string original = resolve_alias(name);
+          auto iter = m_options.find(original);
 
           if (iter == m_options.end())
           {
@@ -2604,7 +2768,8 @@ OptionParser::parse(int argc, const char* const* argv)
       {
         const std::string& name = argu_desc.arg_name;
 
-        auto iter = m_options.find(name);
+        std::string original = resolve_alias(name);
+        auto iter = m_options.find(original);
 
         if (iter == m_options.end())
         {
@@ -2681,6 +2846,31 @@ OptionParser::parse(int argc, const char* const* argv)
 }
 
 inline
+std::string
+OptionParser::resolve_alias(const std::string& alias) const
+{
+  std::string current = alias;
+  std::unordered_set<std::string> visited;
+
+  while (true)
+  {
+    if (visited.count(current))
+    {
+      throw std::invalid_argument("Cycle detected in alias chain involving '" + alias + "'");
+    }
+
+    auto it = m_alias_map.find(current);
+    if (it == m_alias_map.end())
+    {
+      return current;
+    }
+
+    visited.insert(current);
+    current = it->second;
+  }
+}
+
+inline
 void
 OptionParser::finalise_aliases()
 {
@@ -2694,6 +2884,19 @@ OptionParser::finalise_aliases()
     }
 
     m_parsed.emplace(hash, OptionValue());
+  }
+
+  // Add alias mappings
+  for (const auto& alias_entry : m_alias_map)
+  {
+    const std::string& alias = alias_entry.first;
+    const std::string& original = alias_entry.second;
+
+    auto it = m_options.find(original);
+    if (it != m_options.end())
+    {
+      m_keys[alias] = it->second->hash();
+    }
   }
 }
 
@@ -2820,7 +3023,36 @@ Options::help_one_group(const std::string& g) const
       continue;
     }
 
-    auto d = format_description(o, longest + OPTION_DESC_GAP, allowed, m_tab_expansion);
+    // Create a copy of the HelpOptionDetails to modify the description
+    HelpOptionDetails o_with_aliases = o;
+
+    // Add aliases to the description
+    std::vector<std::string> aliases;
+    if (!o.s.empty())
+    {
+      aliases = get_aliases(o.s);
+    }
+    else if (!o.l.empty())
+    {
+      aliases = get_aliases(o.l.front());
+    }
+
+    if (!aliases.empty())
+    {
+      String alias_str = toLocalString(" (aliases: ");
+      for (size_t i = 0; i < aliases.size(); ++i)
+      {
+        if (i > 0)
+        {
+          alias_str += toLocalString(", ");
+        }
+        alias_str += toLocalString(aliases[i]);
+      }
+      alias_str += toLocalString(")");
+      o_with_aliases.desc += alias_str;
+    }
+
+    auto d = format_description(o_with_aliases, longest + OPTION_DESC_GAP, allowed, m_tab_expansion);
 
     result += fiter->first;
     if (stringLength(fiter->first) > longest)
