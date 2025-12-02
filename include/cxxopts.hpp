@@ -411,9 +411,115 @@ class Value : public std::enable_shared_from_this<Value>
 
   virtual bool
   is_boolean() const = 0;
+
+  // 新增约束验证相关接口
+  virtual std::shared_ptr<Value>
+  required() = 0;
+
+  virtual bool
+  is_required() const = 0;
+
+  virtual std::shared_ptr<Value>
+  depends_on(const std::string& other_option) = 0;
+
+  virtual std::shared_ptr<Value>
+  conflicts_with(const std::string& other_option) = 0;
+
+  virtual const std::vector<std::string>&
+  dependencies() const = 0;
+
+  virtual const std::vector<std::string>&
+  conflicts() const = 0;
+};
+
+// 模板类，用于数值型选项的范围约束
+template <typename T>
+class NumericValue : public Value
+{
+  public:
+  virtual ~NumericValue() = default;
+
+  virtual std::shared_ptr<Value>
+  min(const T& min_val) = 0;
+
+  virtual std::shared_ptr<Value>
+  max(const T& max_val) = 0;
+
+  virtual bool
+  has_min() const = 0;
+
+  virtual bool
+  has_max() const = 0;
+
+  virtual const T&
+  get_min() const = 0;
+
+  virtual const T&
+  get_max() const = 0;
+};
+
+// 字符串选项的格式约束类
+class StringValue : public Value
+{
+  public:
+  virtual ~StringValue() = default;
+
+  virtual std::shared_ptr<Value>
+  pattern(const std::string& regex) = 0;
+
+  virtual bool
+  has_pattern() const = 0;
+
+  virtual const std::string&
+  get_pattern() const = 0;
 };
 
 CXXOPTS_DIAGNOSTIC_POP
+
+// 编辑距离算法实现，用于相似选项推荐
+inline int edit_distance(const std::string& s1, const std::string& s2)
+{
+  const std::size_t len1 = s1.size(), len2 = s2.size();
+  std::vector<std::vector<int>> d(len1 + 1, std::vector<int>(len2 + 1));
+
+  for (int i = 0; i <= len1; ++i)
+    d[i][0] = i;
+  for (int j = 0; j <= len2; ++j)
+    d[0][j] = j;
+
+  for (int i = 1; i <= len1; ++i)
+  {
+    for (int j = 1; j <= len2; ++j)
+    {
+      int cost = (s1[i-1] == s2[j-1]) ? 0 : 1;
+      d[i][j] = std::min({d[i-1][j] + 1, d[i][j-1] + 1, d[i-1][j-1] + cost});
+    }
+  }
+
+  return d[len1][len2];
+}
+
+// 找到与目标选项最相似的选项
+inline std::string find_similar_option(const std::string& target, const OptionMap& options)
+{
+  int min_distance = INT_MAX;
+  std::string similar_option;
+
+  for (const auto& pair : options)
+  {
+    const std::string& option = pair.first;
+    int distance = edit_distance(target, option);
+
+    if (distance < min_distance)
+    {
+      min_distance = distance;
+      similar_option = option;
+    }
+  }
+
+  // 只有当编辑距离小于等于2时，才认为是相似选项
+  return (min_distance <= 2) ? similar_option : "";
+}
 
 namespace exceptions {
 
@@ -560,6 +666,89 @@ class incorrect_argument_type : public parsing
   )
   : parsing(
       "Argument " + LQUOTE + arg + RQUOTE + " failed to parse"
+    )
+  {
+  }
+};
+
+class InvalidValueConversion : public parsing
+{
+  public:
+  explicit InvalidValueConversion
+  (
+    const std::string& option,
+    const std::string& value,
+    const std::string& expected_type
+  )
+  : parsing(
+      "Invalid value conversion for option " + LQUOTE + option + RQUOTE + 
+      ": value " + LQUOTE + value + RQUOTE + 
+      " cannot be converted to type " + expected_type
+    )
+  {
+  }
+};
+
+class MissingRequiredOption : public parsing
+{
+  public:
+  explicit MissingRequiredOption
+  (
+    const std::string& option
+  )
+  : parsing(
+      "Missing required option " + LQUOTE + option + RQUOTE
+    )
+  {
+  }
+};
+
+class OptionValueOutOfRange : public parsing
+{
+  public:
+  explicit OptionValueOutOfRange
+  (
+    const std::string& option,
+    const std::string& value,
+    const std::string& range
+  )
+  : parsing(
+      "Option value out of range for option " + LQUOTE + option + RQUOTE + 
+      ": value " + LQUOTE + value + RQUOTE + 
+      " is not within range " + range
+    )
+  {
+  }
+};
+
+class option_dependency_not_satisfied : public parsing
+{
+  public:
+  explicit option_dependency_not_satisfied
+  (
+    const std::string& option,
+    const std::string& dependency
+  )
+  : parsing(
+      "Option " + LQUOTE + option + RQUOTE + 
+      " depends on option " + LQUOTE + dependency + RQUOTE + 
+      ", which is not present"
+    )
+  {
+  }
+};
+
+class option_conflict : public parsing
+{
+  public:
+  explicit option_conflict
+  (
+    const std::string& option,
+    const std::string& conflict
+  )
+  : parsing(
+      "Option " + LQUOTE + option + RQUOTE + 
+      " conflicts with option " + LQUOTE + conflict + RQUOTE
     )
   {
   }
@@ -1181,6 +1370,9 @@ class abstract_value : public Value
     m_implicit = rhs.m_implicit;
     m_default_value = rhs.m_default_value;
     m_implicit_value = rhs.m_implicit_value;
+    m_required = rhs.m_required;
+    m_dependencies = rhs.m_dependencies;
+    m_conflicts = rhs.m_conflicts;
   }
 
   void
@@ -1260,6 +1452,46 @@ class abstract_value : public Value
     return std::is_same<T, bool>::value;
   }
 
+  // 实现新增的约束验证接口
+  std::shared_ptr<Value>
+  required() override
+  {
+    m_required = true;
+    return shared_from_this();
+  }
+
+  bool
+  is_required() const override
+  {
+    return m_required;
+  }
+
+  std::shared_ptr<Value>
+  depends_on(const std::string& other_option) override
+  {
+    m_dependencies.push_back(other_option);
+    return shared_from_this();
+  }
+
+  std::shared_ptr<Value>
+  conflicts_with(const std::string& other_option) override
+  {
+    m_conflicts.push_back(other_option);
+    return shared_from_this();
+  }
+
+  const std::vector<std::string>&
+  dependencies() const override
+  {
+    return m_dependencies;
+  }
+
+  const std::vector<std::string>&
+  conflicts() const override
+  {
+    return m_conflicts;
+  }
+
   const T&
   get() const
   {
@@ -1276,22 +1508,258 @@ class abstract_value : public Value
 
   bool m_default = false;
   bool m_implicit = false;
+  bool m_required = false;
 
   std::string m_default_value{};
   std::string m_implicit_value{};
+
+  std::vector<std::string> m_dependencies{};
+  std::vector<std::string> m_conflicts{};
+};
+
+// 辅助模板类，用于确定standard_value应继承的基类
+template <typename T, typename = void>
+struct standard_value_base
+{
+  using type = abstract_value<T>;
+};
+
+// 对于数值型类型，继承NumericValue
+template <typename T>
+struct standard_value_base<T, typename std::enable_if<std::is_arithmetic<T>::value>::type>
+{
+  using type = NumericValue<T>;
+};
+
+// 对于字符串类型，继承StringValue
+template <>
+struct standard_value_base<std::string>
+{
+  using type = StringValue;
 };
 
 template <typename T>
-class standard_value : public abstract_value<T>
+class standard_value : public standard_value_base<T>::type
 {
+  using Base = typename standard_value_base<T>::type;
+  using AbstractBase = abstract_value<T>;
+
   public:
-  using abstract_value<T>::abstract_value;
+  standard_value() : AbstractBase() {}
+  explicit standard_value(T* t) : AbstractBase(t) {}
 
   CXXOPTS_NODISCARD
   std::shared_ptr<Value>
   clone() const override
   {
     return std::make_shared<standard_value<T>>(*this);
+  }
+
+  // 实现数值型选项的范围约束接口（如果T是数值型）
+  template <typename U = T>
+  typename std::enable_if<std::is_arithmetic<U>::value, std::shared_ptr<Value>>::type
+  min(const U& min_val) override
+  {
+    m_min = min_val;
+    m_has_min = true;
+    return this->shared_from_this();
+  }
+
+  template <typename U = T>
+  typename std::enable_if<std::is_arithmetic<U>::value, std::shared_ptr<Value>>::type
+  max(const U& max_val) override
+  {
+    m_max = max_val;
+    m_has_max = true;
+    return this->shared_from_this();
+  }
+
+  template <typename U = T>
+  typename std::enable_if<std::is_arithmetic<U>::value, bool>::type
+  has_min() const override
+  {
+    return m_has_min;
+  }
+
+  template <typename U = T>
+  typename std::enable_if<std::is_arithmetic<U>::value, bool>::type
+  has_max() const override
+  {
+    return m_has_max;
+  }
+
+  template <typename U = T>
+  typename std::enable_if<std::is_arithmetic<U>::value, const U&>::type
+  get_min() const override
+  {
+    return m_min;
+  }
+
+  template <typename U = T>
+  typename std::enable_if<std::is_arithmetic<U>::value, const U&>::type
+  get_max() const override
+  {
+    return m_max;
+  }
+
+  // 实现字符串选项的格式约束接口（如果T是std::string）
+  std::shared_ptr<Value>
+  pattern(const std::string& regex) override
+  {
+    m_pattern = regex;
+    m_has_pattern = true;
+    return this->shared_from_this();
+  }
+
+  bool
+  has_pattern() const override
+  {
+    return m_has_pattern;
+  }
+
+  const std::string&
+  get_pattern() const override
+  {
+    return m_pattern;
+  }
+
+  // 重写parse方法，添加数值范围约束和字符串格式约束的验证
+  void
+  parse(const std::string& text) const override
+  {
+    AbstractBase::parse(text);
+    validate_value();
+  }
+
+  // 重写add方法，添加数值范围约束和字符串格式约束的验证
+  void
+  add(const std::string& text) const override
+  {
+    AbstractBase::add(text);
+    validate_value();
+  }
+
+  // 重写abstract_value中的方法，确保正确的类型转换
+  std::shared_ptr<Value>
+  required() override
+  {
+    return AbstractBase::required();
+  }
+
+  bool
+  is_required() const override
+  {
+    return AbstractBase::is_required();
+  }
+
+  std::shared_ptr<Value>
+  depends_on(const std::string& other_option) override
+  {
+    return AbstractBase::depends_on(other_option);
+  }
+
+  std::shared_ptr<Value>
+  conflicts_with(const std::string& other_option) override
+  {
+    return AbstractBase::conflicts_with(other_option);
+  }
+
+  const std::vector<std::string>&
+  dependencies() const override
+  {
+    return AbstractBase::dependencies();
+  }
+
+  const std::vector<std::string>&
+  conflicts() const override
+  {
+    return AbstractBase::conflicts();
+  }
+
+  private:
+  // 验证数值范围约束和字符串格式约束
+  void
+  validate_value() const
+  {
+    // 数值范围约束验证
+    if (std::is_arithmetic<T>::value)
+    {
+      const T& value = AbstractBase::get();
+      if (m_has_min && value < m_min)
+      {
+        std::stringstream ss;
+        ss << "Value " << value << " is less than minimum allowed value " << m_min;
+        throw_or_mimic<exceptions::OptionValueOutOfRange>("", ss.str(), "");
+      }
+      if (m_has_max && value > m_max)
+      {
+        std::stringstream ss;
+        ss << "Value " << value << " is greater than maximum allowed value " << m_max;
+        throw_or_mimic<exceptions::OptionValueOutOfRange>("", ss.str(), "");
+      }
+    }
+
+    // 字符串格式约束验证
+    if (std::is_same<T, std::string>::value)
+    {
+      const std::string& value = AbstractBase::get();
+      if (m_has_pattern)
+      {
+        std::regex pattern(m_pattern);
+        if (!std::regex_match(value, pattern))
+        {
+          std::stringstream ss;
+          ss << "Value " << value << " does not match pattern " << m_pattern;
+          throw_or_mimic<exceptions::incorrect_argument_type>(ss.str());
+        }
+      }
+    }
+  }
+
+  private:
+  // 数值型选项的范围约束
+  T m_min{};
+  T m_max{};
+  bool m_has_min = false;
+  bool m_has_max = false;
+
+  // 字符串选项的格式约束
+  std::string m_pattern{};
+  bool m_has_pattern = false;
+};
+
+// 布尔型选项的特殊化
+template <>
+class standard_value<bool> : public abstract_value<bool>
+{
+  public:
+  standard_value()
+  {
+    set_default_and_implicit();
+  }
+
+  explicit standard_value(bool* b)
+  : abstract_value(b)
+  {
+    m_implicit = true;
+    m_implicit_value = "true";
+  }
+
+  std::shared_ptr<Value>
+  clone() const override
+  {
+    return std::make_shared<standard_value<bool>>(*this);
+  }
+
+  private:
+
+  void
+  set_default_and_implicit()
+  {
+    m_default = true;
+    m_default_value = "false";
+    m_implicit = true;
+    m_implicit_value = "true";
   }
 };
 
@@ -1617,6 +2085,19 @@ class KeyValue
   std::string m_value;
 };
 
+// 错误信息结构体
+struct ErrorInfo
+{
+  std::string message;      // 错误消息
+  std::string option;        // 相关选项名（如果有）
+  std::string value;         // 相关输入值（如果有）
+  int index;                  // 命令行参数索引（如果有）
+
+  ErrorInfo(std::string msg, std::string opt = "", std::string val = "", int idx = -1)
+  : message(std::move(msg)), option(std::move(opt)), value(std::move(val)), index(idx)
+  {}
+};
+
 using ParsedHashMap = std::unordered_map<std::size_t, OptionValue>;
 using NameHashMap = std::unordered_map<std::string, std::size_t>;
 
@@ -1710,12 +2191,14 @@ CXXOPTS_DIAGNOSTIC_POP
   ParseResult(const ParseResult&) = default;
 
   ParseResult(NameHashMap&& keys, ParsedHashMap&& values, std::vector<KeyValue> sequential,
-          std::vector<KeyValue> default_opts, std::vector<std::string>&& unmatched_args)
+          std::vector<KeyValue> default_opts, std::vector<std::string>&& unmatched_args, 
+          std::vector<ErrorInfo>&& errors = {})
   : m_keys(std::move(keys))
   , m_values(std::move(values))
   , m_sequential(std::move(sequential))
   , m_defaults(std::move(default_opts))
   , m_unmatched(std::move(unmatched_args))
+  , m_errors(std::move(errors))
   {
   }
 
@@ -1815,6 +2298,19 @@ CXXOPTS_DIAGNOSTIC_POP
     return m_defaults;
   }
 
+  // 新增错误信息访问接口
+  const std::vector<ErrorInfo>&
+  errors() const
+  {
+    return m_errors;
+  }
+
+  bool
+  has_errors() const
+  {
+    return !m_errors.empty();
+  }
+
   const std::string
   arguments_string() const
   {
@@ -1836,6 +2332,7 @@ CXXOPTS_DIAGNOSTIC_POP
   std::vector<KeyValue> m_sequential{};
   std::vector<KeyValue> m_defaults{};
   std::vector<std::string> m_unmatched{};
+  std::vector<ErrorInfo> m_errors{};
 };
 
 struct Option
@@ -1867,10 +2364,11 @@ using PositionalListIterator = PositionalList::const_iterator;
 class OptionParser
 {
   public:
-  OptionParser(const OptionMap& options, const PositionalList& positional, bool allow_unrecognised)
+  OptionParser(const OptionMap& options, const PositionalList& positional, bool allow_unrecognised, bool recovery_mode = false)
   : m_options(options)
   , m_positional(positional)
   , m_allow_unrecognised(allow_unrecognised)
+  , m_recovery_mode(recovery_mode)
   {
   }
 
@@ -1917,6 +2415,7 @@ class OptionParser
   std::vector<KeyValue> m_sequential{};
   std::vector<KeyValue> m_defaults{};
   bool m_allow_unrecognised;
+  bool m_recovery_mode; // 新增恢复模式标志
 
   ParsedHashMap m_parsed{};
   NameHashMap m_keys{};
@@ -1935,6 +2434,7 @@ class Options
   , m_allow_unrecognised(false)
   , m_width(76)
   , m_tab_expansion(false)
+  , m_recovery_mode(false) // 初始化恢复模式为关闭
   , m_options(std::make_shared<OptionMap>())
   {
   }
@@ -1974,11 +2474,25 @@ class Options
     return *this;
   }
 
-  Options&
+  Options& 
   set_tab_expansion(bool expansion=true)
   {
     m_tab_expansion = expansion;
     return *this;
+  }
+
+  // 新增恢复模式设置接口
+  Options& 
+  set_recovery_mode(bool enable=true)
+  {
+    m_recovery_mode = enable;
+    return *this;
+  }
+
+  bool 
+  recovery_mode() const
+  {
+    return m_recovery_mode;
   }
 
   ParseResult
@@ -2088,6 +2602,7 @@ class Options
   bool m_allow_unrecognised;
   std::size_t m_width;
   bool m_tab_expansion;
+  bool m_recovery_mode; // 新增恢复模式标志
 
   std::shared_ptr<OptionMap> m_options;
   std::vector<std::string> m_positional{};
@@ -2505,7 +3020,7 @@ inline
 ParseResult
 Options::parse(int argc, const char* const* argv)
 {
-  OptionParser parser(*m_options, m_positional, m_allow_unrecognised);
+  OptionParser parser(*m_options, m_positional, m_allow_unrecognised, m_recovery_mode);
 
   return parser.parse(argc, argv);
 }
@@ -2518,6 +3033,7 @@ OptionParser::parse(int argc, const char* const* argv)
   auto next_positional = m_positional.begin();
 
   std::vector<std::string> unmatched;
+  std::vector<ErrorInfo> errors; // 新增错误列表
 
   while (current < argc)
   {
@@ -2566,15 +3082,20 @@ OptionParser::parse(int argc, const char* const* argv)
           auto iter = m_options.find(name);
 
           if (iter == m_options.end())
+        {
+          if (m_allow_unrecognised)
           {
-            if (m_allow_unrecognised)
-            {
-              unmatched.push_back(std::string("-") + s[i]);
-              continue;
-            }
-            //error
+            unmatched.push_back(std::string("-") + s[i]);
+            continue;
+          }
+          //error
+          std::string similar_option = find_similar_option(name, m_options);
+          if (!similar_option.empty()) {
+            throw_or_mimic<exceptions::no_such_option>(name + ". Did you mean --" + similar_option + "?");
+          } else {
             throw_or_mimic<exceptions::no_such_option>(name);
           }
+        }
 
           auto value = iter->second;
 
@@ -2616,7 +3137,12 @@ OptionParser::parse(int argc, const char* const* argv)
             continue;
           }
           //error
-          throw_or_mimic<exceptions::no_such_option>(name);
+          std::string similar_option = find_similar_option(name, m_options);
+          if (!similar_option.empty()) {
+            throw_or_mimic<exceptions::no_such_option>(name + ". Did you mean --" + similar_option + "?");
+          } else {
+            throw_or_mimic<exceptions::no_such_option>(name);
+          }
         }
 
         auto opt = iter->second;
@@ -2638,22 +3164,78 @@ OptionParser::parse(int argc, const char* const* argv)
     }
 
     ++current;
+  } catch (const exceptions::exception& e) {
+    // 在恢复模式下，捕获异常并将其添加到错误列表中
+    if (m_recovery_mode) {
+      errors.emplace_back(e.what(), "", "", current);
+      ++current; // 跳过错误的参数
+    } else {
+      throw;
+    }
   }
 
   for (auto& opt : m_options)
   {
-    auto& detail = opt.second;
-    const auto& value = detail->value();
+    try {
+      auto& detail = opt.second;
+      const auto& value = detail->value();
 
-    auto& store = m_parsed[detail->hash()];
+      auto& store = m_parsed[detail->hash()];
 
-    if (value.has_default()) {
-      if (!store.count() && !store.has_default()) {
-        parse_default(detail);
+      if (value.has_default()) {
+        if (!store.count() && !store.has_default()) {
+          parse_default(detail);
+        }
       }
-    }
-    else {
-      parse_no_value(detail);
+      else {
+        parse_no_value(detail);
+      }
+
+      // 检查选项是否为必填项且未提供
+      if (value.is_required() && !store.count() && !store.has_default()) {
+        throw_or_mimic<exceptions::MissingRequiredOption>(detail->essential_name());
+      }
+
+      // 检查选项的依赖关系
+      if (store.count() || store.has_default()) {
+        for (const auto& dep : value.dependencies()) {
+          auto dep_iter = m_options.find(dep);
+          if (dep_iter == m_options.end()) {
+            throw_or_mimic<exceptions::no_such_option>(dep);
+          }
+
+          auto& dep_detail = dep_iter->second;
+          auto dep_hash = dep_detail->hash();
+          auto dep_store_iter = m_parsed.find(dep_hash);
+
+          if (dep_store_iter == m_parsed.end() || !dep_store_iter->second.count() && !dep_store_iter->second.has_default()) {
+            throw_or_mimic<exceptions::option_dependency_not_satisfied>(detail->essential_name(), dep);
+          }
+        }
+
+        // 检查选项的冲突关系
+        for (const auto& conflict : value.conflicts()) {
+          auto conflict_iter = m_options.find(conflict);
+          if (conflict_iter == m_options.end()) {
+            throw_or_mimic<exceptions::no_such_option>(conflict);
+          }
+
+          auto& conflict_detail = conflict_iter->second;
+          auto conflict_hash = conflict_detail->hash();
+          auto conflict_store_iter = m_parsed.find(conflict_hash);
+
+          if (conflict_store_iter != m_parsed.end() && (conflict_store_iter->second.count() || conflict_store_iter->second.has_default())) {
+            throw_or_mimic<exceptions::option_conflict>(detail->essential_name(), conflict);
+          }
+        }
+      }
+    } catch (const exceptions::exception& e) {
+      // 在恢复模式下，捕获异常并将其添加到错误列表中
+      if (m_recovery_mode) {
+        errors.emplace_back(e.what(), opt.first, "", -1);
+      } else {
+        throw;
+      }
     }
   }
 
@@ -2676,7 +3258,7 @@ OptionParser::parse(int argc, const char* const* argv)
 
   finalise_aliases();
 
-  ParseResult parsed(std::move(m_keys), std::move(m_parsed), std::move(m_sequential), std::move(m_defaults), std::move(unmatched));
+  ParseResult parsed(std::move(m_keys), std::move(m_parsed), std::move(m_sequential), std::move(m_defaults), std::move(unmatched), std::move(errors));
   return parsed;
 }
 
