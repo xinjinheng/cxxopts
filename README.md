@@ -113,6 +113,61 @@ parsing arguments derive from `cxxopts::exceptions::parsing`.
 All exceptions define a `what()` function to get a printable string
 explaining the error.
 
+## Recovery Mode
+
+Recovery mode allows the parser to continue parsing even when errors are encountered, instead of immediately throwing exceptions. This is useful for applications that want to:
+1. Collect all errors at once for better user feedback
+2. Proceed with valid options even when some errors exist
+3. Get suggestions for mistyped options
+
+### Enabling Recovery Mode
+
+```cpp
+options.set_recovery_mode(true);
+```
+
+### Error Collection
+
+When recovery mode is enabled, parsing errors are collected instead of thrown. You can access them using:
+
+```cpp
+auto result = options.parse(argc, argv);
+
+if (result.has_errors()) {
+  std::cout << "Errors encountered:\n";
+  for (const auto& error : result.errors()) {
+    std::cout << "  - " << error << "\n";
+  }
+}
+```
+
+### Similar Option Recommendations
+
+When unknown options are encountered, the parser will automatically suggest similar existing options using edit distance algorithm:
+
+```
+Unknown option '--inpt'
+Did you mean '--input'?
+```
+
+### Validation Checks
+
+Even in recovery mode, the parser will still perform all validation checks:
+1. Required options
+2. Option dependencies
+3. Option conflicts
+4. Value type validation
+5. Range checks
+
+All validation errors will be collected in the result object.
+
+### Best Practices
+
+1. Use recovery mode for CLI tools that need user-friendly error reporting
+2. Always check `result.has_errors()` after parsing when recovery mode is enabled
+3. Combine with help output to guide users to correct their command line arguments
+4. Proceed with valid options while reporting errors to the user
+
 ## Help groups
 
 Options can be placed into groups for the purposes of displaying help messages.

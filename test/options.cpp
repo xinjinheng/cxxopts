@@ -42,6 +42,73 @@ class Argv {
   int m_argc;
 };
 
+TEST_CASE("Recovery mode and error handling", "[recovery]")
+{
+  cxxopts::Options options("test_recovery", " - test recovery mode");
+
+  options.set_recovery_mode(true);
+
+  options.add_options()
+    ("help", "print help")
+    ("input,i", "input file", cxxopts::value<std::string>())
+    ("output,o", "output file", cxxopts::value<std::string>())
+    ("verbose,v", "verbose output")
+    ("fast", "fast mode", cxxopts::value<bool>()->default_value("false"))
+    ("required", "required option", cxxopts::value<std::string>()->required())
+    ("depends-on-input", "depends on input", cxxopts::value<bool>()->default_value("false")->depends_on("input"))
+    ("conflict-with-fast", "conflicts with fast", cxxopts::value<bool>()->default_value("false")->conflicts_with("fast"));
+
+  // Test 1: Unknown option with similar option recommendation
+  Argv argv1({"test_recovery", "--inpt", "file.txt", "--verbos"});
+  auto result1 = options.parse(argv1.argc(), argv1.argv());
+
+  CHECK(result1.has_errors() == true);
+  auto errors1 = result1.error_strings();
+  CHECK(errors1.size() >= 2);
+  CHECK(std::any_of(errors1.begin(), errors1.end(), [](const std::string& e) { return e.find("Did you mean") != std::string::npos && e.find("input") != std::string::npos; }));
+  CHECK(std::any_of(errors1.begin(), errors1.end(), [](const std::string& e) { return e.find("Did you mean") != std::string::npos && e.find("verbose") != std::string::npos; }));
+
+  // Test 2: Missing required option
+  Argv argv2({"test_recovery", "--input", "file.txt"});
+  auto result2 = options.parse(argv2.argc(), argv2.argv());
+  CHECK(result2.has_errors() == true);
+  auto errors2 = result2.error_strings();
+  CHECK(std::any_of(errors2.begin(), errors2.end(), [](const std::string& e) { return e.find("required option 'required' is missing") != std::string::npos; }));
+
+  // Test 3: Dependency failure
+  Argv argv3({"test_recovery", "--depends-on-input", "true", "--required", "test"});
+  auto result3 = options.parse(argv3.argc(), argv3.argv());
+  CHECK(result3.has_errors() == true);
+  auto errors3 = result3.error_strings();
+  CHECK(std::any_of(errors3.begin(), errors3.end(), [](const std::string& e) { return e.find("option 'depends-on-input' requires option 'input'") != std::string::npos; }));
+
+  // Test 4: Conflict failure
+  Argv argv4({"test_recovery", "--fast", "true", "--conflict-with-fast", "true", "--required", "test"});
+  auto result4 = options.parse(argv4.argc(), argv4.argv());
+  CHECK(result4.has_errors() == true);
+  auto errors4 = result4.error_strings();
+  CHECK(std::any_of(errors4.begin(), errors4.end(), [](const std::string& e) { return e.find("option 'conflict-with-fast' conflicts with option 'fast'") != std::string::npos; }));
+
+  // Test 5: Valid run with no errors
+  Argv argv5({"test_recovery", "--input", "file.txt", "--output", "out.txt", "--required", "test"});
+  auto result5 = options.parse(argv5.argc(), argv5.argv());
+  CHECK(result5.has_errors() == false);
+  CHECK(result5["input"].as<std::string>() == "file.txt");
+  CHECK(result5["output"].as<std::string>() == "out.txt");
+}
+
+TEST_CASE("Recovery mode disabled throws exceptions", "[recovery]")
+{
+  cxxopts::Options options("test_no_recovery", " - test no recovery mode");
+
+  options.set_recovery_mode(false);
+  options.add_options()
+    ("required", "required option", cxxopts::value<std::string>()->required());
+
+  Argv argv({"test_no_recovery"});
+  CHECK_THROWS_AS(options.parse(argv.argc(), argv.argv()), cxxopts::exceptions::MissingRequiredOption);
+}
+
 TEST_CASE("Basic options", "[options]")
 {
 

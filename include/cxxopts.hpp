@@ -411,6 +411,51 @@ class Value : public std::enable_shared_from_this<Value>
 
   virtual bool
   is_boolean() const = 0;
+  
+  virtual std::shared_ptr<Value>
+  required() = 0;
+  
+  template <typename T>
+  std::shared_ptr<Value>
+  min(T min_val)
+  {
+    return do_min(min_val);
+  }
+  
+  template <typename T>
+  std::shared_ptr<Value>
+  max(T max_val)
+  {
+    return do_max(max_val);
+  }
+  
+  virtual std::shared_ptr<Value>
+  pattern(const std::string& regex) = 0;
+  
+  virtual std::shared_ptr<Value>
+  depends_on(const std::string& other_option) = 0;
+  
+  virtual std::shared_ptr<Value>
+  conflicts_with(const std::string& other_option) = 0;
+  
+private:
+  virtual std::shared_ptr<Value>
+  do_min(long long min_val) = 0;
+  
+  virtual std::shared_ptr<Value>
+  do_min(unsigned long long min_val) = 0;
+  
+  virtual std::shared_ptr<Value>
+  do_min(double min_val) = 0;
+  
+  virtual std::shared_ptr<Value>
+  do_max(long long max_val) = 0;
+  
+  virtual std::shared_ptr<Value>
+  do_max(unsigned long long max_val) = 0;
+  
+  virtual std::shared_ptr<Value>
+  do_max(double max_val) = 0;
 };
 
 CXXOPTS_DIAGNOSTIC_POP
@@ -565,6 +610,86 @@ class incorrect_argument_type : public parsing
   }
 };
 
+class InvalidValueConversion : public parsing
+{
+  public:
+  InvalidValueConversion
+  (
+    const std::string& option,
+    const std::string& value,
+    const std::string& expected_type
+  )
+  : parsing(
+      "Option " + LQUOTE + option + RQUOTE + 
+      ": unable to convert value " + LQUOTE + value + RQUOTE +
+      " to expected type " + expected_type
+    )
+  {
+  }
+};
+
+class MissingRequiredOption : public parsing
+{
+  public:
+  explicit MissingRequiredOption(const std::string& option)
+  : parsing(
+      "Required option " + LQUOTE + option + RQUOTE + " is missing"
+    )
+  {
+  }
+  
+  MissingRequiredOption(const std::vector<std::string>& options)
+  : parsing(build_message(options))
+  {
+  }
+  
+private:
+  static std::string build_message(const std::vector<std::string>& options)
+  {
+    std::string msg = "Missing required options: ";
+    for (size_t i = 0; i < options.size(); ++i) {
+      if (i > 0) msg += ", ";
+      msg += LQUOTE + options[i] + RQUOTE;
+    }
+    return msg;
+  }
+};
+
+class OptionValueOutOfRange : public parsing
+{
+  public:
+  template <typename T>
+  OptionValueOutOfRange
+  (
+    const std::string& option,
+    const std::string& value,
+    T min_val,
+    T max_val
+  )
+  : parsing(
+      "Option " + LQUOTE + option + RQUOTE + 
+      ": value " + LQUOTE + value + RQUOTE +
+      " is out of range [" + std::to_string(min_val) + ", " + std::to_string(max_val) + "]"
+    )
+  {}
+};
+
+class option_dependency : public parsing
+{
+  public:
+  explicit option_dependency(const std::string& msg)
+  : parsing(msg)
+  {}
+};
+
+class option_conflict : public parsing
+{
+  public:
+  explicit option_conflict(const std::string& msg)
+  : parsing(msg)
+  {}
+};
+
 } // namespace exceptions
 
 
@@ -592,6 +717,62 @@ using OptionNames = std::vector<std::string>;
 namespace values {
 
 namespace parser_tool {
+
+inline
+std::size_t
+levenshtein_distance(const std::string& a, const std::string& b)
+{
+  if (a.empty()) return b.size();
+  if (b.empty()) return a.size();
+  
+  std::vector<std::size_t> prev(b.size() + 1);
+  std::vector<std::size_t> curr(b.size() + 1);
+  
+  for (std::size_t i = 0; i <= b.size(); ++i) {
+    prev[i] = i;
+  }
+  
+  for (std::size_t i = 1; i <= a.size(); ++i) {
+    curr[0] = i;
+    for (std::size_t j = 1; j <= b.size(); ++j) {
+      std::size_t cost = (a[i-1] == b[j-1]) ? 0 : 1;
+      curr[j] = std::min({
+        prev[j] + 1,
+        curr[j-1] + 1,
+        prev[j-1] + cost
+      });
+    }
+    prev.swap(curr);
+  }
+  
+  return prev[b.size()];
+}
+
+template <typename OptionMap>
+std::vector<std::string>
+find_similar_options(const std::string& input, const OptionMap& options, std::size_t max_distance = 2)
+{
+  std::vector<std::pair<std::size_t, std::string>> matches;
+  
+  for (const auto& entry : options) {
+    const auto& option = entry.second;
+    for (const auto& name : option.names) {
+      std::size_t distance = levenshtein_distance(input, name);
+      if (distance <= max_distance) {
+        matches.emplace_back(distance, name);
+      }
+    }
+  }
+  
+  std::sort(matches.begin(), matches.end());
+  
+  std::vector<std::string> result;
+  for (const auto& match : matches) {
+    result.push_back(match.second);
+  }
+  
+  return result;
+}
 
 struct IntegerDesc
 {
@@ -1181,6 +1362,18 @@ class abstract_value : public Value
     m_implicit = rhs.m_implicit;
     m_default_value = rhs.m_default_value;
     m_implicit_value = rhs.m_implicit_value;
+    m_required = rhs.m_required;
+    m_min_set = rhs.m_min_set;
+    m_max_set = rhs.m_max_set;
+    m_min_int = rhs.m_min_int;
+    m_max_int = rhs.m_max_int;
+    m_min_uint = rhs.m_min_uint;
+    m_max_uint = rhs.m_max_uint;
+    m_min_double = rhs.m_min_double;
+    m_max_double = rhs.m_max_double;
+    m_pattern = rhs.m_pattern;
+    m_depends_on = rhs.m_depends_on;
+    m_conflicts_with = rhs.m_conflicts_with;
   }
 
   void
@@ -1260,6 +1453,57 @@ class abstract_value : public Value
     return std::is_same<T, bool>::value;
   }
 
+  std::shared_ptr<Value>
+  required() override
+  {
+    m_required = true;
+    return shared_from_this();
+  }
+
+  std::shared_ptr<Value>
+  pattern(const std::string& regex) override
+  {
+    m_pattern = regex;
+    return shared_from_this();
+  }
+  
+  std::shared_ptr<Value>
+  depends_on(const std::string& other_option) override
+  {
+    m_depends_on.push_back(other_option);
+    return shared_from_this();
+  }
+  
+  std::shared_ptr<Value>
+  conflicts_with(const std::string& other_option) override
+  {
+    m_conflicts_with.push_back(other_option);
+    return shared_from_this();
+  }
+  
+  bool is_required() const { return m_required; }
+  bool has_min() const { return m_min_set; }
+  bool has_max() const { return m_max_set; }
+  
+  template<typename U>
+  bool check_range(const U& value) const {
+    if (std::is_integral<U>::value && std::is_signed<U>::value) {
+      if (m_min_set && value < static_cast<U>(m_min_int)) return false;
+      if (m_max_set && value > static_cast<U>(m_max_int)) return false;
+    } else if (std::is_integral<U>::value && !std::is_signed<U>::value) {
+      if (m_min_set && value < static_cast<U>(m_min_uint)) return false;
+      if (m_max_set && value > static_cast<U>(m_max_uint)) return false;
+    } else if (std::is_floating_point<U>::value) {
+      if (m_min_set && value < static_cast<U>(m_min_double)) return false;
+      if (m_max_set && value > static_cast<U>(m_max_double)) return false;
+    }
+    return true;
+  }
+  
+  const std::string& get_pattern() const { return m_pattern; }
+  const std::vector<std::string>& get_depends_on() const { return m_depends_on; }
+  const std::vector<std::string>& get_conflicts_with() const { return m_conflicts_with; }
+
   const T&
   get() const
   {
@@ -1276,9 +1520,73 @@ class abstract_value : public Value
 
   bool m_default = false;
   bool m_implicit = false;
+  bool m_required = false;
+  
+  bool m_min_set = false;
+  bool m_max_set = false;
+  
+  long long m_min_int = 0;
+  long long m_max_int = 0;
+  unsigned long long m_min_uint = 0;
+  unsigned long long m_max_uint = 0;
+  double m_min_double = 0.0;
+  double m_max_double = 0.0;
+  
+  std::string m_pattern{};
+  std::vector<std::string> m_depends_on{};
+  std::vector<std::string> m_conflicts_with{};
 
   std::string m_default_value{};
   std::string m_implicit_value{};
+  
+private:
+  std::shared_ptr<Value>
+  do_min(long long min_val) override
+  {
+    m_min_set = true;
+    m_min_int = min_val;
+    return shared_from_this();
+  }
+  
+  std::shared_ptr<Value>
+  do_min(unsigned long long min_val) override
+  {
+    m_min_set = true;
+    m_min_uint = min_val;
+    return shared_from_this();
+  }
+  
+  std::shared_ptr<Value>
+  do_min(double min_val) override
+  {
+    m_min_set = true;
+    m_min_double = min_val;
+    return shared_from_this();
+  }
+  
+  std::shared_ptr<Value>
+  do_max(long long max_val) override
+  {
+    m_max_set = true;
+    m_max_int = max_val;
+    return shared_from_this();
+  }
+  
+  std::shared_ptr<Value>
+  do_max(unsigned long long max_val) override
+  {
+    m_max_set = true;
+    m_max_uint = max_val;
+    return shared_from_this();
+  }
+  
+  std::shared_ptr<Value>
+  do_max(double max_val) override
+  {
+    m_max_set = true;
+    m_max_double = max_val;
+    return shared_from_this();
+  }
 };
 
 template <typename T>
@@ -1620,6 +1928,18 @@ class KeyValue
 using ParsedHashMap = std::unordered_map<std::size_t, OptionValue>;
 using NameHashMap = std::unordered_map<std::string, std::size_t>;
 
+struct ParseError
+{
+  std::string message;
+  std::string option;
+  std::string value;
+  int arg_index = -1;
+  
+  ParseError(std::string msg, std::string opt = {}, std::string val = {}, int idx = -1)
+    : message(std::move(msg)), option(std::move(opt)), value(std::move(val)), arg_index(idx)
+  {}
+};
+
 class ParseResult
 {
   public:
@@ -1710,17 +2030,47 @@ CXXOPTS_DIAGNOSTIC_POP
   ParseResult(const ParseResult&) = default;
 
   ParseResult(NameHashMap&& keys, ParsedHashMap&& values, std::vector<KeyValue> sequential,
-          std::vector<KeyValue> default_opts, std::vector<std::string>&& unmatched_args)
+          std::vector<KeyValue> default_opts, std::vector<std::string>&& unmatched_args,
+          std::vector<ParseError>&& errors = {})
   : m_keys(std::move(keys))
   , m_values(std::move(values))
   , m_sequential(std::move(sequential))
   , m_defaults(std::move(default_opts))
   , m_unmatched(std::move(unmatched_args))
-  {
-  }
+  , m_errors(std::move(errors))
+  {}
 
   ParseResult& operator=(ParseResult&&) = default;
   ParseResult& operator=(const ParseResult&) = default;
+  
+  const std::vector<ParseError>& errors() const
+  {
+    return m_errors;
+  }
+  
+  std::vector<std::string> error_strings() const
+  {
+    std::vector<std::string> result;
+    for (const auto& err : m_errors) {
+      result.push_back(err.message);
+    }
+    return result;
+  }
+  
+  bool has_errors() const
+  {
+    return !m_errors.empty();
+  }
+  
+  void add_error(ParseError error)
+  {
+    m_errors.push_back(std::move(error));
+  }
+  
+  void add_error(std::string message, std::string option = {}, std::string value = {}, int arg_index = -1)
+  {
+    m_errors.emplace_back(std::move(message), std::move(option), std::move(value), arg_index);
+  }
 
   Iterator
   begin() const
@@ -1836,6 +2186,7 @@ CXXOPTS_DIAGNOSTIC_POP
   std::vector<KeyValue> m_sequential{};
   std::vector<KeyValue> m_defaults{};
   std::vector<std::string> m_unmatched{};
+  std::vector<ParseError> m_errors{};
 };
 
 struct Option
@@ -1867,10 +2218,11 @@ using PositionalListIterator = PositionalList::const_iterator;
 class OptionParser
 {
   public:
-  OptionParser(const OptionMap& options, const PositionalList& positional, bool allow_unrecognised)
+  OptionParser(const OptionMap& options, const PositionalList& positional, bool allow_unrecognised, bool recovery_mode = false)
   : m_options(options)
   , m_positional(positional)
   , m_allow_unrecognised(allow_unrecognised)
+  , m_recovery_mode(recovery_mode)
   {
   }
 
@@ -1907,6 +2259,22 @@ class OptionParser
   void
   parse_no_value(const std::shared_ptr<OptionDetails>& details);
 
+  public:
+  const std::vector<ParseError>& errors() const
+  {
+    return m_errors;
+  }
+  
+  bool has_errors() const
+  {
+    return !m_errors.empty();
+  }
+  
+  void add_error(ParseError error)
+  {
+    m_errors.push_back(std::move(error));
+  }
+  
   private:
 
   void finalise_aliases();
@@ -1917,9 +2285,11 @@ class OptionParser
   std::vector<KeyValue> m_sequential{};
   std::vector<KeyValue> m_defaults{};
   bool m_allow_unrecognised;
+  bool m_recovery_mode;
 
   ParsedHashMap m_parsed{};
   NameHashMap m_keys{};
+  std::vector<ParseError> m_errors{};
 };
 
 class Options
@@ -1933,6 +2303,7 @@ class Options
   , m_positional_help("positional parameters")
   , m_show_positional(false)
   , m_allow_unrecognised(false)
+  , m_recovery_mode(false)
   , m_width(76)
   , m_tab_expansion(false)
   , m_options(std::make_shared<OptionMap>())
@@ -1979,6 +2350,18 @@ class Options
   {
     m_tab_expansion = expansion;
     return *this;
+  }
+
+  Options&
+  set_recovery_mode(bool enable=true)
+  {
+    m_recovery_mode = enable;
+    return *this;
+  }
+  
+  bool is_recovery_mode() const noexcept
+  {
+    return m_recovery_mode;
   }
 
   ParseResult
@@ -2086,6 +2469,7 @@ class Options
   std::string m_positional_help{};
   bool m_show_positional;
   bool m_allow_unrecognised;
+  bool m_recovery_mode;
   std::size_t m_width;
   bool m_tab_expansion;
 
@@ -2390,15 +2774,70 @@ void
 OptionParser::parse_option
 (
   const std::shared_ptr<OptionDetails>& value,
-  const std::string& /*name*/,
+  const std::string& name,
   const std::string& arg
 )
 {
-  auto hash = value->hash();
-  auto& result = m_parsed[hash];
-  result.parse(value, arg);
+  try {
+    auto hash = value->hash();
+    auto& result = m_parsed[hash];
+    
+    // Validate constraints before parsing
+    const auto& abstract_val = value->value();
+    
+    // Pattern validation for string options
+    if (!abstract_val.get_pattern().empty()) {
+#ifdef CXXOPTS_USE_REGEX
+      std::regex pattern(abstract_val.get_pattern());
+      if (!std::regex_match(arg, pattern)) {
+        throw exceptions::InvalidValueConversion(name, arg, std::string("matching pattern: ") + abstract_val.get_pattern());
+      }
+#endif
+    }
+    
+    result.parse(value, arg);
+    
+    // Validate range after parsing
+    if (abstract_val.check_range_failed(result)) {
+      throw exceptions::OptionValueOutOfRange(name, arg, abstract_val.get_min_int(), abstract_val.get_max_int());
+    }
 
-  m_sequential.emplace_back(value->essential_name(), arg);
+    m_sequential.emplace_back(value->essential_name(), arg);
+  } catch (const exceptions::InvalidValueConversion& e) {
+    if (m_recovery_mode) {
+      add_error(ParseError(e.what(), name, arg));
+      // Use default value if available
+      if (value->value().has_default()) {
+        auto hash = value->hash();
+        auto& result = m_parsed[hash];
+        if (!result.count()) {
+          parse_default(value);
+        }
+      }
+    } else {
+      throw;
+    }
+  } catch (const exceptions::OptionValueOutOfRange& e) {
+    if (m_recovery_mode) {
+      add_error(ParseError(e.what(), name, arg));
+      // Use default value if available
+      if (value->value().has_default()) {
+        auto hash = value->hash();
+        auto& result = m_parsed[hash];
+        if (!result.count()) {
+          parse_default(value);
+        }
+      }
+    } else {
+      throw;
+    }
+  } catch (const exceptions::parsing& e) {
+    if (m_recovery_mode) {
+      add_error(ParseError(e.what(), name, arg));
+    } else {
+      throw;
+    }
+  }
 }
 
 inline
@@ -2420,7 +2859,11 @@ OptionParser::checked_parse_arg
     }
     else
     {
-      throw_or_mimic<exceptions::missing_argument>(name);
+      if (m_recovery_mode) {
+        add_error(ParseError("Missing argument for option: '" + name + "'", name, "", current));
+      } else {
+        throw_or_mimic<exceptions::missing_argument>(name);
+      }
     }
   }
   else
@@ -2505,9 +2948,16 @@ inline
 ParseResult
 Options::parse(int argc, const char* const* argv)
 {
-  OptionParser parser(*m_options, m_positional, m_allow_unrecognised);
+  OptionParser parser(*m_options, m_positional, m_allow_unrecognised, m_recovery_mode);
 
-  return parser.parse(argc, argv);
+  auto result = parser.parse(argc, argv);
+  
+  // Add collected errors to parse result
+  for (const auto& error : parser.errors()) {
+    result.add_error(error);
+  }
+  
+  return result;
 }
 
 inline ParseResult
@@ -2538,7 +2988,24 @@ OptionParser::parse(int argc, const char* const* argv)
       // but if it starts with a `-`, then it's an error
       if (argv[current][0] == '-' && argv[current][1] != '\0') {
         if (!m_allow_unrecognised) {
-          throw_or_mimic<exceptions::invalid_option_syntax>(argv[current]);
+          if (m_recovery_mode) {
+            std::string option = argv[current];
+            auto similar = values::parser_tool::find_similar_options(option.substr(1), m_options);
+            
+            std::string msg = "Invalid option syntax: '" + option + "'";
+            if (!similar.empty()) {
+              msg += ". Did you mean: ";
+              for (size_t i = 0; i < similar.size(); ++i) {
+                if (i > 0) msg += ", ";
+                msg += "'" + similar[i] + "'";
+              }
+            }
+            
+            add_error(ParseError(msg, option, "", current));
+            unmatched.emplace_back(argv[current]);
+          } else {
+            throw_or_mimic<exceptions::invalid_option_syntax>(argv[current]);
+          }
         }
       }
 
@@ -2573,7 +3040,24 @@ OptionParser::parse(int argc, const char* const* argv)
               continue;
             }
             //error
-            throw_or_mimic<exceptions::no_such_option>(name);
+            if (m_recovery_mode) {
+              auto similar = values::parser_tool::find_similar_options(name, m_options);
+              
+              std::string msg = "No such option: '" + name + "'";
+              if (!similar.empty()) {
+                msg += ". Did you mean: ";
+                for (size_t i = 0; i < similar.size(); ++i) {
+                  if (i > 0) msg += ", ";
+                  msg += "'" + similar[i] + "'";
+                }
+              }
+              
+              add_error(ParseError(msg, name, "", current));
+              unmatched.push_back(std::string("-") + s[i]);
+              continue;
+            } else {
+              throw_or_mimic<exceptions::no_such_option>(name);
+            }
           }
 
           auto value = iter->second;
@@ -2596,7 +3080,12 @@ OptionParser::parse(int argc, const char* const* argv)
           else
           {
             //error
-            throw_or_mimic<exceptions::option_requires_argument>(name);
+            if (m_recovery_mode) {
+              add_error(ParseError("Option requires an argument: '" + name + "'", name, "", current));
+              continue;
+            } else {
+              throw_or_mimic<exceptions::option_requires_argument>(name);
+            }
           }
         }
       }
@@ -2616,7 +3105,25 @@ OptionParser::parse(int argc, const char* const* argv)
             continue;
           }
           //error
-          throw_or_mimic<exceptions::no_such_option>(name);
+          if (m_recovery_mode) {
+            auto similar = values::parser_tool::find_similar_options(name, m_options);
+            
+            std::string msg = "No such option: '" + name + "'";
+            if (!similar.empty()) {
+              msg += ". Did you mean: ";
+              for (size_t i = 0; i < similar.size(); ++i) {
+                if (i > 0) msg += ", ";
+                msg += "'" + similar[i] + "'";
+              }
+            }
+            
+            add_error(ParseError(msg, name, "", current));
+            unmatched.emplace_back(argv[current]);
+            ++current;
+            continue;
+          } else {
+            throw_or_mimic<exceptions::no_such_option>(name);
+          }
         }
 
         auto opt = iter->second;
@@ -2675,8 +3182,91 @@ OptionParser::parse(int argc, const char* const* argv)
   }
 
   finalise_aliases();
+  
+  // Check required options
+  std::vector<std::string> missing_required;
+  for (auto& opt : m_options)
+  {
+    auto& detail = opt.second;
+    if (detail->value().is_required())
+    {
+      auto& store = m_parsed[detail->hash()];
+      if (store.count() == 0 && !detail->value().has_default())
+      {
+        missing_required.push_back(detail->essential_name());
+      }
+    }
+  }
+  
+  if (!missing_required.empty())
+  {
+    if (m_recovery_mode)
+    {
+      exceptions::MissingRequiredOption ex(missing_required);
+      add_error(ParseError(ex.what()));
+    }
+    else
+    {
+      throw_or_mimic<exceptions::MissingRequiredOption>(missing_required);
+    }
+  }
+  
+  // Check dependencies and conflicts
+  for (auto& opt : m_options)
+  {
+    auto& detail = opt.second;
+    const auto& value = detail->value();
+    auto& store = m_parsed[detail->hash()];
+    
+    if (store.count() > 0)
+    {
+      // Check dependencies
+      for (const auto& dep : value.get_depends_on())
+      {
+        auto dep_iter = m_options.find(dep);
+        if (dep_iter != m_options.end())
+        {
+          auto& dep_store = m_parsed[dep_iter->second->hash()];
+          if (dep_store.count() == 0 && !dep_iter->second->value().has_default())
+          {
+            std::string msg = "Option '" + detail->essential_name() + "' requires option '" + dep + "'";
+            if (m_recovery_mode)
+            {
+              add_error(ParseError(msg));
+            }
+            else
+            {
+              throw_or_mimic<exceptions::option_dependency>(msg);
+            }
+          }
+        }
+      }
+      
+      // Check conflicts
+      for (const auto& conflict : value.get_conflicts_with())
+      {
+        auto conflict_iter = m_options.find(conflict);
+        if (conflict_iter != m_options.end())
+        {
+          auto& conflict_store = m_parsed[conflict_iter->second->hash()];
+          if (conflict_store.count() > 0)
+          {
+            std::string msg = "Option '" + detail->essential_name() + "' conflicts with option '" + conflict + "'";
+            if (m_recovery_mode)
+            {
+              add_error(ParseError(msg));
+            }
+            else
+            {
+              throw_or_mimic<exceptions::option_conflict>(msg);
+            }
+          }
+        }
+      }
+    }
+  }
 
-  ParseResult parsed(std::move(m_keys), std::move(m_parsed), std::move(m_sequential), std::move(m_defaults), std::move(unmatched));
+  ParseResult parsed(std::move(m_keys), std::move(m_parsed), std::move(m_sequential), std::move(m_defaults), std::move(unmatched), std::move(m_errors));
   return parsed;
 }
 
