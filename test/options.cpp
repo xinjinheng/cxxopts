@@ -1191,3 +1191,135 @@ TEST_CASE("No Options help", "[options]")
   CHECK_NOTHROW(options.parse(argc, argv));
   CHECK(options.help().find("test <posArg1>...<posArgN>") != std::string::npos);
 }
+
+TEST_CASE("Numeric range constraints", "[constraints]")
+{
+  cxxopts::Options options("test", "test numeric range constraints");
+
+  options.add_options()
+    ("age,a", "Age", cxxopts::value<int>()->min(1)->max(120))
+    ("score,s", "Score", cxxopts::value<double>()->min(0.0)->max(100.0));
+
+  // Test valid values
+  Argv av1({"test", "--age", "25", "--score", "85.5"});
+  auto result1 = options.parse(av1.argc(), av1.argv());
+  CHECK(result1["age"].as<int>() == 25);
+  CHECK(result1["score"].as<double>() == 85.5);
+
+  // Test invalid age (too low)
+  Argv av2({"test", "--age", "0", "--score", "85.5"});
+  CHECK_THROWS_AS(options.parse(av2.argc(), av2.argv()), cxxopts::exceptions::OptionValueOutOfRange);
+
+  // Test invalid age (too high)
+  Argv av3({"test", "--age", "121", "--score", "85.5"});
+  CHECK_THROWS_AS(options.parse(av3.argc(), av3.argv()), cxxopts::exceptions::OptionValueOutOfRange);
+
+  // Test invalid score (too low)
+  Argv av4({"test", "--age", "25", "--score", "-0.5"});
+  CHECK_THROWS_AS(options.parse(av4.argc(), av4.argv()), cxxopts::exceptions::OptionValueOutOfRange);
+
+  // Test invalid score (too high)
+  Argv av5({"test", "--age", "25", "--score", "100.5"});
+  CHECK_THROWS_AS(options.parse(av5.argc(), av5.argv()), cxxopts::exceptions::OptionValueOutOfRange);
+}
+
+TEST_CASE("String pattern constraints", "[constraints]")
+{
+  cxxopts::Options options("test", "test string pattern constraints");
+
+  options.add_options()
+    ("email,e", "Email", cxxopts::value<std::string>()->pattern("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"))
+    ("phone,p", "Phone", cxxopts::value<std::string>()->pattern("^\\d{3}-\\d{3}-\\d{4}$"));
+
+  // Test valid email and phone
+  Argv av1({"test", "--email", "test@example.com", "--phone", "123-456-7890"});
+  auto result1 = options.parse(av1.argc(), av1.argv());
+  CHECK(result1["email"].as<std::string>() == "test@example.com");
+  CHECK(result1["phone"].as<std::string>() == "123-456-7890");
+
+  // Test invalid email (missing @)
+  Argv av2({"test", "--email", "testexample.com", "--phone", "123-456-7890"});
+  CHECK_THROWS_AS(options.parse(av2.argc(), av2.argv()), cxxopts::exceptions::OptionValuePatternMismatch);
+
+  // Test invalid email (invalid domain)
+  Argv av3({"test", "--email", "test@example", "--phone", "123-456-7890"});
+  CHECK_THROWS_AS(options.parse(av3.argc(), av3.argv()), cxxopts::exceptions::OptionValuePatternMismatch);
+
+  // Test invalid phone (wrong format)
+  Argv av4({"test", "--email", "test@example.com", "--phone", "1234567890"});
+  CHECK_THROWS_AS(options.parse(av4.argc(), av4.argv()), cxxopts::exceptions::OptionValuePatternMismatch);
+
+  // Test invalid phone (too short)
+  Argv av5({"test", "--email", "test@example.com", "--phone", "123-456-789"});
+  CHECK_THROWS_AS(options.parse(av5.argc(), av5.argv()), cxxopts::exceptions::OptionValuePatternMismatch);
+}
+
+TEST_CASE("Option dependencies", "[constraints]")
+{
+  cxxopts::Options options("test", "test option dependencies");
+
+  options.add_options()
+    ("input,i", "Input file", cxxopts::value<std::string>())
+    ("output,o", "Output file", cxxopts::value<std::string>())
+    ("format,f", "Output format", cxxopts::value<std::string>())
+    ("compress,c", "Compress output", cxxopts::value<bool>());
+
+  // Set dependencies
+  options.add_option_dependency("output", "input");
+  options.add_option_dependency("format", "output");
+  options.add_option_dependency("compress", "output");
+
+  // Test valid (all dependencies satisfied)
+  Argv av1({"test", "--input", "input.txt", "--output", "output.txt", "--format", "json", "--compress"});
+  auto result1 = options.parse(av1.argc(), av1.argv());
+  CHECK(result1.count("input") == 1);
+  CHECK(result1.count("output") == 1);
+  CHECK(result1.count("format") == 1);
+  CHECK(result1.count("compress") == 1);
+
+  // Test invalid (output without input)
+  Argv av2({"test", "--output", "output.txt"});
+  CHECK_THROWS_AS(options.parse(av2.argc(), av2.argv()), cxxopts::exceptions::OptionDependencyError);
+
+  // Test invalid (format without output)
+  Argv av3({"test", "--input", "input.txt", "--format", "json"});
+  CHECK_THROWS_AS(options.parse(av3.argc(), av3.argv()), cxxopts::exceptions::OptionDependencyError);
+
+  // Test invalid (compress without output)
+  Argv av4({"test", "--input", "input.txt", "--compress"});
+  CHECK_THROWS_AS(options.parse(av4.argc(), av4.argv()), cxxopts::exceptions::OptionDependencyError);
+}
+
+TEST_CASE("Recovery mode", "[recovery]")
+{
+  cxxopts::Options options("test", "test recovery mode");
+
+  options.add_options()
+    ("input,i", "Input file", cxxopts::value<std::string>())
+    ("output,o", "Output file", cxxopts::value<std::string>())
+    ("age,a", "Age", cxxopts::value<int>()->min(1)->max(120))
+    ("email,e", "Email", cxxopts::value<std::string>()->pattern("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"));
+
+  // Set dependencies
+  options.add_option_dependency("output", "input");
+
+  // Test recovery mode with multiple errors
+  Argv av({"test", "--output", "output.txt", "--age", "150", "--email", "invalid-email", "--nonexistent", "value"});
+  
+  // Enable recovery mode
+  options.set_recovery_mode(true);
+  
+  // Parse should not throw in recovery mode
+  auto result = options.parse(av.argc(), av.argv());
+  
+  // Check that valid options are parsed
+  CHECK(result.count("output") == 1);
+  CHECK(result["output"].as<std::string>() == "output.txt");
+  
+  // Check that errors are collected
+  auto errors = result.errors();
+  CHECK(errors.size() == 4);
+  
+  // Disable recovery mode for subsequent tests
+  options.set_recovery_mode(false);
+}
