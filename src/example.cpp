@@ -150,6 +150,37 @@ parse(int argc, const char* argv[])
       std::cout << "}" << std::endl;
     }
 
+    // Example of recovery mode and error handling best practices
+    std::cout << "\n--- Recovery Mode Example ---" << std::endl;
+    cxxopts::Options recovery_options(argv[0], " - recovery mode example");
+    recovery_options.set_recovery_mode(true);
+    recovery_options.add_options()
+      ("input,i", "input file", cxxopts::value<std::string>())
+      ("output,o", "output file", cxxopts::value<std::string>())
+      ("verbose,v", "verbose output")
+      ("required", "required option", cxxopts::value<std::string>()->required());
+
+    // Simulate incorrect command line with typos and missing required options
+    const char* test_argv[] = {argv[0], "--inpt", "data.txt", "--verbos"};
+    int test_argc = 4;
+
+    auto recovery_result = recovery_options.parse(test_argc, test_argv);
+
+    if (recovery_result.has_errors()) {
+      std::cout << "\nFound " << recovery_result.error_strings().size() << " errors:\n";
+      for (const auto& error : recovery_result.error_strings()) {
+        std::cout << "  - " << error << "\n";
+      }
+    } else {
+      std::cout << "\nNo errors found!" << std::endl;
+    }
+
+    // Show how to proceed with valid options even when errors exist
+    if (recovery_result.count("input")) {
+      std::cout << "\nValid input option found: " << recovery_result["input"].as<std::string>() << std::endl;
+    }
+    }
+
     if (result.count("int"))
     {
       std::cout << "int = " << result["int"].as<int>() << std::endl;
